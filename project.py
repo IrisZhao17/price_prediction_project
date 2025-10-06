@@ -12,6 +12,9 @@ from matplotlib.pyplot import figure
 
 from alpha_vantage.timeseries import TimeSeries
 
+import yfinance as yf
+import pandas as pd
+
 print("All libraries loaded")
 
 config = {
@@ -50,20 +53,28 @@ config = {
 }
 
 def download_data(config):
-    ts = TimeSeries(key=config["alpha_vantage"]["key"])
-    data, meta_data = ts.get_daily_adjusted(config["alpha_vantage"]["symbol"], outputsize=config["alpha_vantage"]["outputsize"])
+    symbol = config["alpha_vantage"]["symbol"]  # "IBM"
+    df = yf.download(symbol, period="5y", interval="1d",
+                     auto_adjust=True, progress=False)
 
-    data_date = [date for date in data.keys()]
-    data_date.reverse()
+    if df.empty:
+        raise RuntimeError(f"No data returned for {symbol}")
 
-    data_close_price = [float(data[date][config["alpha_vantage"]["key_adjusted_close"]]) for date in data.keys()]
-    data_close_price.reverse()
-    data_close_price = np.array(data_close_price)
+    df = df.dropna()
 
-    num_data_points = len(data_date)
-    display_date_range = "from " + data_date[0] + " to " + data_date[num_data_points-1]
-    print("Number data points", num_data_points, display_date_range)
+    if isinstance(df.columns, pd.MultiIndex):
+        # 先尝试 Adj Close，没有就 Close
+        if ('Adj Close', symbol) in df.columns:
+            s = df[('Adj Close', symbol)]
+        else:
+            s = df[('Close', symbol)]
+    else:
+        s = df['Adj Close'] if 'Adj Close' in df.columns else df['Close']
 
+    data_close_price = s.to_list()
+    data_date = [d.strftime("%Y-%m-%d") for d in df.index]
+    num_data_points = len(data_close_price)
+    display_date_range = f"{data_date[0]} to {data_date[-1]}"
     return data_date, data_close_price, num_data_points, display_date_range
 
 data_date, data_close_price, num_data_points, display_date_range = download_data(config)
@@ -77,7 +88,7 @@ xticks = [data_date[i] if ((i%config["plots"]["xticks_interval"]==0 and (num_dat
 x = np.arange(0,len(xticks))
 plt.xticks(x, xticks, rotation='vertical')
 plt.title("Daily close price for " + config["alpha_vantage"]["symbol"] + ", " + display_date_range)
-plt.grid(b=None, which='major', axis='y', linestyle='--')
+plt.grid(which='major', axis='y', linestyle='--')
 plt.show()
 
 class Normalizer():
@@ -145,7 +156,7 @@ xticks = [data_date[i] if ((i%config["plots"]["xticks_interval"]==0 and (num_dat
 x = np.arange(0,len(xticks))
 plt.xticks(x, xticks, rotation='vertical')
 plt.title("Daily close prices for " + config["alpha_vantage"]["symbol"] + " - showing training and validation data")
-plt.grid(b=None, which='major', axis='y', linestyle='--')
+plt.grid(True, which='major', axis='y', linestyle='--')
 plt.legend()
 plt.show()
 
@@ -316,7 +327,7 @@ plt.title("Compare predicted prices to actual prices")
 xticks = [data_date[i] if ((i%config["plots"]["xticks_interval"]==0 and (num_data_points-i) > config["plots"]["xticks_interval"]) or i==num_data_points-1) else None for i in range(num_data_points)] # make x ticks nice
 x = np.arange(0,len(xticks))
 plt.xticks(x, xticks, rotation='vertical')
-plt.grid(b=None, which='major', axis='y', linestyle='--')
+plt.grid(True, which='major', axis='y', linestyle='--')
 plt.legend()
 plt.show()
 
@@ -336,7 +347,7 @@ plt.title("Zoom in to examine predicted price on validation data portion")
 xticks = [to_plot_data_date[i] if ((i%int(config["plots"]["xticks_interval"]/5)==0 and (len(to_plot_data_date)-i) > config["plots"]["xticks_interval"]/6) or i==len(to_plot_data_date)-1) else None for i in range(len(to_plot_data_date))] # make x ticks nice
 xs = np.arange(0,len(xticks))
 plt.xticks(xs, xticks, rotation='vertical')
-plt.grid(b=None, which='major', axis='y', linestyle='--')
+plt.grid(True, which='major', axis='y', linestyle='--')
 plt.legend()
 plt.show()
 
@@ -375,7 +386,7 @@ plt.plot(plot_date_test, to_plot_data_y_val, label="Actual prices", marker=".", 
 plt.plot(plot_date_test, to_plot_data_y_val_pred, label="Past predicted prices", marker=".", markersize=10, color=config["plots"]["color_pred_val"])
 plt.plot(plot_date_test, to_plot_data_y_test_pred, label="Predicted price for next day", marker=".", markersize=20, color=config["plots"]["color_pred_test"])
 plt.title("Predicting the close price of the next trading day")
-plt.grid(b=None, which='major', axis='y', linestyle='--')
+plt.grid(True, which='major', axis='y', linestyle='--')
 plt.legend()
 plt.show()
 
