@@ -2,7 +2,7 @@ import numpy as np
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as Func
 import torch.optim as optim
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
@@ -270,46 +270,36 @@ train_dataloader = DataLoader(dataset_train, batch_size=config["training"]["batc
 val_dataloader = DataLoader(dataset_val, batch_size=config["training"]["batch_size"], shuffle=True)
 
 
-class LSTMModel(nn.Module):
-    def __init__(self, input_size=1, hidden_layer_size=32, num_layers=2, output_size=1, dropout=0.2):
+class AttnLSTMRegressor(nn.Module):
+    def __init__(self, input_size=16, hidden=64, num_layers=2, dropout=0.1, k_recent=8):
         super().__init__()
-        self.hidden_layer_size = hidden_layer_size
-
-        self.linear_1 = nn.Linear(input_size, hidden_layer_size)
-        self.relu = nn.ReLU()
-        self.lstm = nn.LSTM(hidden_layer_size, hidden_size=self.hidden_layer_size, num_layers=num_layers,
-                            batch_first=True)
+        self.feat = nn.Linear(input_size, hidden)
+        self.lstm = nn.LSTM(hidden, hidden, num_layers=num_layers, batch_first=True)
+        self.attn_score = nn.Linear(hidden, 1)
+        self.tau = nn.Parameter(torch.tensor(0.2))   # learnable temperature, 现在预测价格较平滑，调小tau可使之不平滑
         self.dropout = nn.Dropout(dropout)
-        self.linear_2 = nn.Linear(num_layers * hidden_layer_size, output_size)
+        self.k_recent = k_recent
+        self.reg_head = nn.Linear(2*hidden, 1)       # concat(last_h, ctx)
 
-        self.init_weights()
+        for n,p in self.lstm.named_parameters():
+            if 'bias' in n: nn.init.constant_(p, 0.)
+            elif 'weight_ih' in n: nn.init.kaiming_normal_(p)
+            elif 'weight_hh' in n: nn.init.orthogonal_(p)
 
-    def init_weights(self):
-        for name, param in self.lstm.named_parameters():
-            if 'bias' in name:
-                nn.init.constant_(param, 0.0)
-            elif 'weight_ih' in name:
-                nn.init.kaiming_normal_(param)
-            elif 'weight_hh' in name:
-                nn.init.orthogonal_(param)
+    def forward(self, x):              # x: [B,T,F]
+        h = torch.relu(self.feat(x))   # [B,T,H]
+        out, _ = self.lstm(h)          # [B,T,H]
 
-    def forward(self, x):
-        batchsize = x.shape[0]
+        # attention on recent k steps (sharpened by temperature)
+        out_k = out[:, -self.k_recent:, :]                       # [B,k,H]
+        e = self.attn_score(out_k).squeeze(-1)                   # [B,k]
+        alpha = torch.softmax(e / self.tau.clamp_min(1e-2), 1)   # [B,k]
+        ctx = torch.bmm(alpha.unsqueeze(1), out_k).squeeze(1)    # [B,H]
 
-        # layer 1
-        x = self.linear_1(x)
-        x = self.relu(x)
-
-        # LSTM layer
-        lstm_out, (h_n, c_n) = self.lstm(x)
-
-        # reshape output from hidden cell into [batch, features] for `linear_2`
-        x = h_n.permute(1, 0, 2).reshape(batchsize, -1)
-
-        # layer 2
-        x = self.dropout(x)
-        predictions = self.linear_2(x)
-        return predictions[:, -1]
+        last_h = out[:, -1, :]                                   # [B,H]
+        feat = torch.cat([last_h, ctx], dim=1)                   # [B,2H]
+        pred = self.reg_head(self.dropout(feat)).squeeze(-1)     # [B]
+        return pred
 
 
 def run_epoch(dataloader, is_training=False):
@@ -346,8 +336,8 @@ def run_epoch(dataloader, is_training=False):
 train_dataloader = DataLoader(dataset_train, batch_size=config["training"]["batch_size"], shuffle=True)
 val_dataloader = DataLoader(dataset_val, batch_size=config["training"]["batch_size"], shuffle=True)
 
-model = LSTMModel(input_size=config["model"]["input_size"], hidden_layer_size=config["model"]["lstm_size"],
-                  num_layers=config["model"]["num_lstm_layers"], output_size=1, dropout=config["model"]["dropout"])
+model = AttnLSTMRegressor(input_size=config["model"]["input_size"], hidden=config["model"]["lstm_size"],
+                  num_layers=config["model"]["num_lstm_layers"], dropout=config["model"]["dropout"])
 model = model.to(config["training"]["device"])
 
 criterion = nn.MSELoss()
