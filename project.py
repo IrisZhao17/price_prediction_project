@@ -46,15 +46,14 @@ config = {
     "training": {
         "device": "cpu", # "cuda" or "cpu"
         "batch_size": 64,
-        "num_epoch": 100,
-        "learning_rate": 0.01,
+        "num_epoch": 15,
+        "learning_rate": 0.02,
         "scheduler_step_size": 40,
+        "lambda_cls": 0.5,   # 分类损失权重，先试 0.3~1.0
     }
 }
 
 def download_data(config):
-    import yfinance as yf
-    import pandas as pd
 
     symbol = config["alpha_vantage"]["symbol"]  # e.g. "AAPL"
     df = yf.download(symbol, period="5y", interval="1d", auto_adjust=False, progress=False)
@@ -110,7 +109,6 @@ class Normalizer():
 
 # normalize
 scaler = Normalizer()
-normalized_data_close = scaler.fit_transform(data_close)
 
 # ===== 新增：技术指标构建 =====
 
@@ -156,14 +154,14 @@ def build_features_from_ohlc(open_np, high_np, low_np, close_np):
     # 丢 NaN，得到有效 T'
     df = df.dropna().reset_index(drop=True)
 
-    # feature_cols = [
-    #     "open","high","low","close",
-    #     "hl_range","oc_change","ret1","logret1",
-    #     "sma5","ema12","macd","macd_hist","bb_z","rv5"
-    # ]
     feature_cols = [
-        "open","high","low","close"
+        "open","high","low","close",
+        "hl_range","oc_change","ret1","logret1",
+        "sma5","ema12","macd","macd_hist","bb_z","rv5"
     ]
+    # feature_cols = [
+    #     "open","high","low","close"
+    # ]
     features = df[feature_cols].astype(np.float32).values  # [T', F]
     return features, feature_cols
 
@@ -200,11 +198,22 @@ y_close_cut = normalized_close[offset:]  # [T']
 data_x, data_x_unseen = prepare_multifeat_windows(X_norm, config["data"]["window_size"])
 data_y = y_close_cut[config["data"]["window_size"]:]
 
+# === 方向标签：下一日是否上涨（使用原始收盘价，避免归一化方向被扰动） ===
+raw_close = np.asarray(data_close, dtype=np.float32)
+offset = len(data_close) - X_norm.shape[0]  # 你上文已有同名变量，确保一致
+window_size = config["data"]["window_size"]
+
+raw_cut = raw_close[offset:]                       # [T']
+y_raw     = raw_cut[window_size:]                  # 对齐 data_y 的那一段（今天）
+y_raw_prev= raw_cut[window_size-1:-1]              # 昨天
+data_y_cls = (y_raw - y_raw_prev > 0).astype(np.float32)  # 涨=1 跌=0
+assert len(data_y_cls) == len(data_y)
+
 # 训练/验证划分
 split_index = int(data_y.shape[0] * config["data"]["train_split_size"])
-data_x_train, data_x_val = data_x[:split_index], data_x[split_index:]
-data_y_train, data_y_val = data_y[:split_index], data_y[split_index:]
-
+data_x_train, data_x_val   = data_x[:split_index],   data_x[split_index:]
+data_y_train, data_y_val   = data_y[:split_index],   data_y[split_index:]
+data_yc_train, data_yc_val = data_y_cls[:split_index], data_y_cls[split_index:]
 
 # prepare data for plotting
 num_points = num_data_points  # 建议确保 = len(data_close_price)
@@ -226,8 +235,8 @@ assert 0 <= train_start <= train_end <= num_points, (train_start, train_end, num
 assert 0 <= val_start   <= val_end   <= num_points, (val_start,   val_end,   num_points)
 
 # 确保 inverse_transform 的输入是二维
-y_train_inv = scaler.inverse_transform(np.asarray(data_y_train).reshape(-1, 1)).ravel()
-y_val_inv   = scaler.inverse_transform(np.asarray(data_y_val).reshape(-1, 1)).ravel()
+y_train_inv = scaler_y.inverse_transform(np.asarray(data_y_train).reshape(-1, 1)).ravel()
+y_val_inv   = scaler_y.inverse_transform(np.asarray(data_y_val).reshape(-1, 1)).ravel()
 
 # 再次校验左右长度完全一致
 assert (train_end - train_start) == len(y_train_inv)
@@ -253,96 +262,113 @@ plt.show()
 
 
 class TimeSeriesDataset(Dataset):
-    def __init__(self, x, y):
-        self.x = x.astype(np.float32)   # [N, window, F]
-        self.y = y.astype(np.float32)   # [N]
-    def __len__(self): return len(self.x)
-    def __getitem__(self, idx): return (self.x[idx], self.y[idx])
+    def __init__(self, x, y_reg, y_cls):
+        self.x     = x.astype(np.float32)
+        self.y_reg = y_reg.astype(np.float32).reshape(-1)
+        self.y_cls = y_cls.astype(np.float32).reshape(-1)
 
+    def __len__(self):
+        return len(self.x)
 
-dataset_train = TimeSeriesDataset(data_x_train, data_y_train)
-dataset_val = TimeSeriesDataset(data_x_val, data_y_val)
+    def __getitem__(self, idx):
+        return self.x[idx], self.y_reg[idx], self.y_cls[idx]
 
-print("Train data shape", dataset_train.x.shape, dataset_train.y.shape)
-print("Validation data shape", dataset_val.x.shape, dataset_val.y.shape)
+dataset_train = TimeSeriesDataset(data_x_train, data_y_train, data_yc_train)
+dataset_val   = TimeSeriesDataset(data_x_val,   data_y_val,   data_yc_val)
 
 train_dataloader = DataLoader(dataset_train, batch_size=config["training"]["batch_size"], shuffle=True)
 val_dataloader = DataLoader(dataset_val, batch_size=config["training"]["batch_size"], shuffle=True)
 
 
-class AttnLSTMRegressor(nn.Module):
-    def __init__(self, input_size=16, hidden=64, num_layers=2, dropout=0.1, k_recent=8):
+class AttnLSTMMTL(nn.Module):
+    def __init__(self, input_size=16, hidden=64, num_layers=2, dropout=0.1, k_recent=6):
         super().__init__()
         self.feat = nn.Linear(input_size, hidden)
         self.lstm = nn.LSTM(hidden, hidden, num_layers=num_layers, batch_first=True)
         self.attn_score = nn.Linear(hidden, 1)
-        self.tau = nn.Parameter(torch.tensor(0.2))   # learnable temperature, 现在预测价格较平滑，调小tau可使之不平滑
+        self.tau = nn.Parameter(torch.tensor(0.15))
         self.dropout = nn.Dropout(dropout)
         self.k_recent = k_recent
-        self.reg_head = nn.Linear(2*hidden, 1)       # concat(last_h, ctx)
+
+        # 双头：回归 + 分类(logit)
+        self.reg_head = nn.Linear(2*hidden, 1)
+        self.cls_head = nn.Linear(2*hidden, 1)
 
         for n,p in self.lstm.named_parameters():
             if 'bias' in n: nn.init.constant_(p, 0.)
             elif 'weight_ih' in n: nn.init.kaiming_normal_(p)
             elif 'weight_hh' in n: nn.init.orthogonal_(p)
 
-    def forward(self, x):              # x: [B,T,F]
-        h = torch.relu(self.feat(x))   # [B,T,H]
-        out, _ = self.lstm(h)          # [B,T,H]
+    def forward(self, x):  # x: [B,T,F]
+        h = torch.relu(self.feat(x))     # [B,T,H]
+        out, _ = self.lstm(h)            # [B,T,H]
 
-        # attention on recent k steps (sharpened by temperature)
-        out_k = out[:, -self.k_recent:, :]                       # [B,k,H]
-        e = self.attn_score(out_k).squeeze(-1)                   # [B,k]
-        alpha = torch.softmax(e / self.tau.clamp_min(1e-2), 1)   # [B,k]
-        ctx = torch.bmm(alpha.unsqueeze(1), out_k).squeeze(1)    # [B,H]
+        out_k = out[:, -self.k_recent:, :]               # [B,k,H]
+        e = self.attn_score(out_k).squeeze(-1)           # [B,k]
+        tau = self.tau.clamp_min(1e-2)
+        alpha = torch.softmax(e / tau, dim=1)            # [B,k]
+        ctx = torch.bmm(alpha.unsqueeze(1), out_k).squeeze(1)  # [B,H]
 
-        last_h = out[:, -1, :]                                   # [B,H]
-        feat = torch.cat([last_h, ctx], dim=1)                   # [B,2H]
-        pred = self.reg_head(self.dropout(feat)).squeeze(-1)     # [B]
-        return pred
+        last_h = out[:, -1, :]                           # [B,H]
+        feat = torch.cat([last_h, ctx], dim=1)           # [B,2H]
+        feat = self.dropout(feat)
+
+        pred_reg = self.reg_head(feat).squeeze(-1)       # [B] (归一化价格的预测)
+        logit    = self.cls_head(feat).squeeze(-1)       # [B] (上涨概率的logit)
+        return pred_reg, logit
 
 
 def run_epoch(dataloader, is_training=False):
-    epoch_loss = 0
-
+    epoch_loss = 0.0
     if is_training:
         model.train()
     else:
         model.eval()
 
-    for idx, (x, y) in enumerate(dataloader):
+    for idx, (x, y_reg, y_cls) in enumerate(dataloader):
         if is_training:
             optimizer.zero_grad()
 
-        batchsize = x.shape[0]
+        x     = x.to(config["training"]["device"])
+        y_reg = y_reg.to(config["training"]["device"])
+        y_cls = y_cls.to(config["training"]["device"])
 
-        x = x.to(config["training"]["device"])
-        y = y.to(config["training"]["device"])
-
-        out = model(x)
-        loss = criterion(out.contiguous(), y.contiguous())
+        pred_reg, logit = model(x)  # [B], [B]
+        loss_reg = criterion_reg(pred_reg.contiguous(), y_reg.contiguous())
+        loss_cls = criterion_cls(logit.contiguous(), y_cls.view(-1))
+        loss = loss_reg + config["training"]["lambda_cls"] * loss_cls
 
         if is_training:
             loss.backward()
             optimizer.step()
 
-        epoch_loss += (loss.detach().item() / batchsize)
+        epoch_loss += (loss.detach().item() / x.shape[0])
 
     lr = scheduler.get_last_lr()[0]
-
     return epoch_loss, lr
 
 
 train_dataloader = DataLoader(dataset_train, batch_size=config["training"]["batch_size"], shuffle=True)
 val_dataloader = DataLoader(dataset_val, batch_size=config["training"]["batch_size"], shuffle=True)
 
-model = AttnLSTMRegressor(input_size=config["model"]["input_size"], hidden=config["model"]["lstm_size"],
-                  num_layers=config["model"]["num_lstm_layers"], dropout=config["model"]["dropout"])
+model = AttnLSTMMTL(input_size=config["model"]["input_size"],
+                    hidden=config["model"]["lstm_size"],
+                    num_layers=config["model"]["num_lstm_layers"],
+                    dropout=config["model"]["dropout"])
+
 model = model.to(config["training"]["device"])
 
 criterion = nn.MSELoss()
+criterion_reg = nn.SmoothL1Loss()              # 回归
+criterion_cls = nn.BCEWithLogitsLoss()         # 分类（直接吃 logit）
+
 optimizer = optim.Adam(model.parameters(), lr=config["training"]["learning_rate"], betas=(0.9, 0.98), eps=1e-9)
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=config["training"]["scheduler_step_size"], gamma=0.1)
+# scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=config["training"]["scheduler_step_size"], gamma=0.1)
+#
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer, T_max=config["training"]["num_epoch"], eta_min=1e-4
+)
+
 
 for epoch in range(config["training"]["num_epoch"]):
     loss_train, lr_train = run_epoch(train_dataloader, is_training=True)
@@ -358,27 +384,46 @@ for epoch in range(config["training"]["num_epoch"]):
 train_dataloader = DataLoader(dataset_train, batch_size=config["training"]["batch_size"], shuffle=False)
 val_dataloader = DataLoader(dataset_val, batch_size=config["training"]["batch_size"], shuffle=False)
 
+# ===== Predict on TRAIN set (regression + classification prob) =====
 model.eval()
 
-# predict on the training data, to see how well the model managed to learn and memorize
-
 predicted_train = np.array([])
+prob_train      = np.array([])
+ytrain_true     = np.array([])
+ytrain_cls_true = np.array([])
 
-for idx, (x, y) in enumerate(train_dataloader):
-    x = x.to(config["training"]["device"])
-    out = model(x)
-    out = out.cpu().detach().numpy()
-    predicted_train = np.concatenate((predicted_train, out))
+# 注意：为了和真实标签对齐，最好用一个不打乱顺序的 DataLoader
+# 建议：单独建 train_eval_loader = DataLoader(dataset_train, batch_size=..., shuffle=False)
+# 如果你直接用 train_dataloader，请确保它当下是 shuffle=False
+eval_loader = train_dataloader
+
+with torch.no_grad():
+    for x, y_reg, y_cls in eval_loader:
+        x = x.to(config["training"]["device"])
+        pred_reg, logit = model(x)                    # [B], [B]
+        out = pred_reg.cpu().numpy()                  # 回归输出（一般是归一化空间）
+        p   = torch.sigmoid(logit).cpu().numpy()      # 上涨概率
+
+        predicted_train = np.concatenate((predicted_train, out))
+        prob_train      = np.concatenate((prob_train, p))
+        ytrain_true     = np.concatenate((ytrain_true, y_reg.numpy()))
+        ytrain_cls_true = np.concatenate((ytrain_cls_true, y_cls.numpy()))
+
 
 # predict on the validation data, to see how the model does
 
 predicted_val = np.array([])
+prob_val      = np.array([])
 
-for idx, (x, y) in enumerate(val_dataloader):
+for idx, (x, y_reg, y_cls) in enumerate(val_dataloader):
     x = x.to(config["training"]["device"])
-    out = model(x)
-    out = out.cpu().detach().numpy()
+    with torch.no_grad():
+        pred_reg, logit = model(x)
+        out = pred_reg.cpu().numpy()                 # 回归
+        p   = torch.sigmoid(logit).cpu().numpy()     # 概率
     predicted_val = np.concatenate((predicted_val, out))
+    prob_val      = np.concatenate((prob_val, p))
+
 
 # === prepare data for plotting (predictions) ===
 num_points = num_data_points
@@ -399,8 +444,8 @@ assert 0 <= train_start <= train_end <= num_points
 assert 0 <= val_start   <= val_end   <= num_points
 
 # inverse_transform 需要二维；再 ravel 回一维
-pred_train_inv = scaler.inverse_transform(np.asarray(predicted_train).reshape(-1, 1)).ravel()
-pred_val_inv   = scaler.inverse_transform(np.asarray(predicted_val).reshape(-1, 1)).ravel()
+pred_train_inv = scaler_y.inverse_transform(np.asarray(predicted_train).reshape(-1, 1)).ravel()
+pred_val_inv   = scaler_y.inverse_transform(np.asarray(predicted_val).reshape(-1, 1)).ravel()
 
 # 再次校验左右长度一致
 assert (train_end - train_start) == len(pred_train_inv)
@@ -430,8 +475,8 @@ plt.show()
 window_size = config["data"]["window_size"]
 
 # 反归一化 (确保二维输入再拉平)
-y_val_inv = scaler.inverse_transform(np.asarray(data_y_val).reshape(-1, 1)).ravel()
-pred_val_inv = scaler.inverse_transform(np.asarray(predicted_val).reshape(-1, 1)).ravel()
+y_val_inv = scaler_y.inverse_transform(np.asarray(data_y_val).reshape(-1, 1)).ravel()
+pred_val_inv = scaler_y.inverse_transform(np.asarray(predicted_val).reshape(-1, 1)).ravel()
 
 # 若预测数量和标签数量不等（例如 DataLoader(drop_last=True)），裁成相同长度
 L = min(len(y_val_inv), len(pred_val_inv))
@@ -479,9 +524,8 @@ model.eval()
 
 x = torch.tensor(data_x_unseen, dtype=torch.float32, device=config["training"]["device"]).unsqueeze(0)  # [1, window, F]
 with torch.no_grad():
-    prediction = model(x)              # 形状通常是 [1, out_dim] 或 [1, seq, out_dim]
-prediction = prediction.cpu().numpy()
-
+    pred_reg, logit = model(x)
+prediction = pred_reg.cpu().numpy()
 
 # === prepare plots (robust) ===
 plot_range = 10                      # 想展示的最后N天 + 明天
@@ -490,11 +534,11 @@ assert plot_range >= 2               # 至少要有 (N-1) 个历史点 + 1 个�
 window_size = config["data"]["window_size"]
 
 # 1) 反归一化（确保二维输入再拉平）
-y_val_inv   = scaler.inverse_transform(np.asarray(data_y_val).reshape(-1, 1)).ravel()
-pred_val_inv= scaler.inverse_transform(np.asarray(predicted_val).reshape(-1, 1)).ravel()
+y_val_inv   = scaler_y.inverse_transform(np.asarray(data_y_val).reshape(-1, 1)).ravel()
+pred_val_inv= scaler_y.inverse_transform(np.asarray(predicted_val).reshape(-1, 1)).ravel()
 
 # 对“明天”的预测做反归一化；prediction 可能是 [1] / [1,1] / [seq,1]，统一成标量
-pred_next_inv_arr = scaler.inverse_transform(np.asarray(prediction).reshape(-1, 1)).ravel()
+pred_next_inv_arr = scaler_y.inverse_transform(np.asarray(prediction).reshape(-1, 1)).ravel()
 pred_next_inv = float(pred_next_inv_arr[-1])  # 取最后一个作为“下一天”的点
 
 # 2) 历史展示长度（N-1），与实际可用长度对齐
