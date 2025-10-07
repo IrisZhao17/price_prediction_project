@@ -53,37 +53,40 @@ config = {
 }
 
 def download_data(config):
-    symbol = config["alpha_vantage"]["symbol"]  # "IBM"
-    df = yf.download(symbol, period="5y", interval="1d",
-                     auto_adjust=True, progress=False)
+    import yfinance as yf
+    import pandas as pd
+
+    symbol = config["alpha_vantage"]["symbol"]  # e.g. "AAPL"
+    df = yf.download(symbol, period="5y", interval="1d", auto_adjust=False, progress=False)
 
     if df.empty:
         raise RuntimeError(f"No data returned for {symbol}")
 
     df = df.dropna()
 
-    if isinstance(df.columns, pd.MultiIndex):
-        # 先尝试 Adj Close，没有就 Close
-        if ('Adj Close', symbol) in df.columns:
-            s = df[('Adj Close', symbol)]
-        else:
-            s = df[('Close', symbol)]
-    else:
-        s = df['Adj Close'] if 'Adj Close' in df.columns else df['Close']
+    # 使用原始列：['Open','High','Low','Close','Adj Close','Volume']
+    ohlc = df[["Open", "High", "Low", "Close"]].copy()
 
-    data_close_price = s.to_list()
-    data_date = [d.strftime("%Y-%m-%d") for d in df.index]
-    num_data_points = len(data_close_price)
+    data_open = ohlc["Open"].to_numpy()
+    data_high = ohlc["High"].to_numpy()
+    data_low  = ohlc["Low"].to_numpy()
+    data_close = ohlc["Close"].to_numpy()
+    data_date = [d.strftime("%Y-%m-%d") for d in ohlc.index]
+
+    num_data_points = len(data_close)
     display_date_range = f"{data_date[0]} to {data_date[-1]}"
-    return data_date, data_close_price, num_data_points, display_date_range
+    return data_date, data_open, data_high, data_low, data_close, num_data_points, display_date_range
 
-data_date, data_close_price, num_data_points, display_date_range = download_data(config)
+
+# 调用
+data_date, data_open, data_high, data_low, data_close, num_data_points, display_date_range = download_data(config)
+
 
 # plot
 
 fig = figure(figsize=(25, 5), dpi=80)
 fig.patch.set_facecolor((1.0, 1.0, 1.0))
-plt.plot(data_date, data_close_price, color=config["plots"]["color_actual"])
+plt.plot(data_date, data_close, color=config["plots"]["color_actual"])
 xticks = [data_date[i] if ((i%config["plots"]["xticks_interval"]==0 and (num_data_points-i) > config["plots"]["xticks_interval"]) or i==num_data_points-1) else None for i in range(num_data_points)] # make x ticks nice
 x = np.arange(0,len(xticks))
 plt.xticks(x, xticks, rotation='vertical')
@@ -107,45 +110,61 @@ class Normalizer():
 
 # normalize
 scaler = Normalizer()
-normalized_data_close_price = scaler.fit_transform(data_close_price)
+normalized_data_close = scaler.fit_transform(data_close)
 
 # ===== 新增：技术指标构建 =====
 
-def build_features_from_close(close_np: np.ndarray):
-    """
-    输入: close_np 为 shape [T] 的原始收盘价（未标准化）
-    输出: features_df (dropna 后), 对齐到有效起点
-    """
-    df = pd.DataFrame({"close": close_np})
-    # 1) 一阶收益/对数收益
+def build_features_from_ohlc(open_np, high_np, low_np, close_np):
+    import numpy as np
+    import pandas as pd
+
+    # ---- 保证每列是一维并且长度一致 ----
+    o = np.asarray(open_np).ravel()
+    h = np.asarray(high_np).ravel()
+    l = np.asarray(low_np).ravel()
+    c = np.asarray(close_np).ravel()
+
+    n = len(c)
+    assert len(o) == len(h) == len(l) == len(c) and n > 0, \
+        (len(o), len(h), len(l), len(c))
+
+    df = pd.DataFrame({
+        "open": o,
+        "high": h,
+        "low":  l,
+        "close": c,
+    })
+
+    # === 基础特征 & 指标（保持因果）===
+    df["hl_range"] = df["high"] - df["low"]
+    df["oc_change"] = df["close"] - df["open"]
     df["ret1"] = df["close"].pct_change()
     df["logret1"] = np.log(df["close"]).diff()
 
-    # 2) 移动平均 / EMA / MACD
     df["sma5"]  = df["close"].rolling(5).mean()
-    df["sma10"] = df["close"].rolling(10).mean()
     df["ema12"] = df["close"].ewm(span=12, adjust=False).mean()
-    df["ema26"] = df["close"].ewm(span=26, adjust=False).mean()
-    macd = df["ema12"] - df["ema26"]
-    macd_sig = macd.ewm(span=9, adjust=False).mean()
-    df["macd"] = macd
-    df["macd_sig"] = macd_sig
-    df["macd_hist"] = macd - macd_sig
+    ema26       = df["close"].ewm(span=26, adjust=False).mean()
+    df["macd"]      = df["ema12"] - ema26
+    df["macd_sig"]  = df["macd"].ewm(span=9, adjust=False).mean()
+    df["macd_hist"] = df["macd"] - df["macd_sig"]
 
-    # 3) 布林带 z-score（20日）
     mid = df["close"].rolling(20).mean()
     std = df["close"].rolling(20).std()
     df["bb_z"] = (df["close"] - mid) / std
+    df["rv5"]  = df["logret1"].rolling(5).std() * np.sqrt(252)
 
-    # 4) 近 5 日年化波动率（用对数收益）
-    df["rv5"] = df["logret1"].rolling(5).std() * np.sqrt(252)
-
-    # 防泄漏：只使用到当日（滚动/EMA 自带因果性）
+    # 丢 NaN，得到有效 T'
     df = df.dropna().reset_index(drop=True)
 
-    feature_cols = ["close","ret1","logret1","sma5","sma10","ema12","ema26",
-                    "macd","macd_sig","macd_hist","bb_z","rv5"]
-    features = df[feature_cols].values.astype(np.float32)  # [T', F]
+    # feature_cols = [
+    #     "open","high","low","close",
+    #     "hl_range","oc_change","ret1","logret1",
+    #     "sma5","ema12","macd","macd_hist","bb_z","rv5"
+    # ]
+    feature_cols = [
+        "open","high","low","close"
+    ]
+    features = df[feature_cols].astype(np.float32).values  # [T', F]
     return features, feature_cols
 
 
@@ -160,40 +179,63 @@ def prepare_multifeat_windows(X_2d: np.ndarray, window_size: int):
     X_unseen = X_2d[-window_size:, :]
     return X_win, X_unseen
 
-# 1) 构造特征（用原始 close）
-features_raw, feature_cols = build_features_from_close(data_close_price)
+# 构建特征矩阵
+features_raw, feature_cols = build_features_from_ohlc(data_open, data_high, data_low, data_close)
 
-# 2) 按列标准化（改用已有 Normalizer，对 axis=0 生效）
+# 按列标准化
 scaler_X = Normalizer()
-X_norm = scaler_X.fit_transform(features_raw)  # [T', F]
+X_norm = scaler_X.fit_transform(features_raw)   # shape [T', F]
 F = X_norm.shape[1]
 config["model"]["input_size"] = F
 
-# 3) 注意：y 仍然用“标准化后的 close”，要与特征对齐到相同 T'
-#    我们计算出 features 开始的相对起点偏移
-offset = len(data_close_price) - X_norm.shape[0]
-y_close_cut = normalized_data_close_price[offset:]  # [T']
+# y: 标准化的 close（目标值）
+scaler_y = Normalizer()
+normalized_close = scaler_y.fit_transform(np.array(data_close).reshape(-1, 1)).ravel()
 
-# 4) 造样本
+# 对齐 offset
+offset = len(data_close) - X_norm.shape[0]
+y_close_cut = normalized_close[offset:]  # [T']
+
+# 滑动窗口
 data_x, data_x_unseen = prepare_multifeat_windows(X_norm, config["data"]["window_size"])
-data_y = y_close_cut[config["data"]["window_size"]:]  # [T' - window]
+data_y = y_close_cut[config["data"]["window_size"]:]
 
-# 5) 训练/验证划分（与原版一致）
-split_index = int(data_y.shape[0]*config["data"]["train_split_size"])
+# 训练/验证划分
+split_index = int(data_y.shape[0] * config["data"]["train_split_size"])
 data_x_train, data_x_val = data_x[:split_index], data_x[split_index:]
 data_y_train, data_y_val = data_y[:split_index], data_y[split_index:]
 
 
 # prepare data for plotting
+num_points = num_data_points  # 建议确保 = len(data_close_price)
 
-to_plot_data_y_train = np.zeros(num_data_points)
-to_plot_data_y_val = np.zeros(num_data_points)
+to_plot_data_y_train = np.full(num_points, np.nan, dtype=float)
+to_plot_data_y_val   = np.full(num_points, np.nan, dtype=float)
 
-to_plot_data_y_train[config["data"]["window_size"]:split_index+config["data"]["window_size"]] = scaler.inverse_transform(data_y_train)
-to_plot_data_y_val[split_index+config["data"]["window_size"]:] = scaler.inverse_transform(data_y_val)
+window_size = config["data"]["window_size"]
 
-to_plot_data_y_train = np.where(to_plot_data_y_train == 0, None, to_plot_data_y_train)
-to_plot_data_y_val = np.where(to_plot_data_y_val == 0, None, to_plot_data_y_val)
+# 计算切片区间
+train_start = offset + window_size
+train_end   = train_start + len(data_y_train)
+
+val_start   = offset + window_size + split_index
+val_end     = val_start + len(data_y_val)
+
+# 边界与长度自检（出问题会直接抛错，方便定位）
+assert 0 <= train_start <= train_end <= num_points, (train_start, train_end, num_points)
+assert 0 <= val_start   <= val_end   <= num_points, (val_start,   val_end,   num_points)
+
+# 确保 inverse_transform 的输入是二维
+y_train_inv = scaler.inverse_transform(np.asarray(data_y_train).reshape(-1, 1)).ravel()
+y_val_inv   = scaler.inverse_transform(np.asarray(data_y_val).reshape(-1, 1)).ravel()
+
+# 再次校验左右长度完全一致
+assert (train_end - train_start) == len(y_train_inv)
+assert (val_end   - val_start)   == len(y_val_inv)
+
+# 赋值
+to_plot_data_y_train[train_start:train_end] = y_train_inv
+to_plot_data_y_val[val_start:val_end]       = y_val_inv
 
 ## plots
 
@@ -348,22 +390,42 @@ for idx, (x, y) in enumerate(val_dataloader):
     out = out.cpu().detach().numpy()
     predicted_val = np.concatenate((predicted_val, out))
 
-# prepare data for plotting
+# === prepare data for plotting (predictions) ===
+num_points = num_data_points
+window_size = config["data"]["window_size"]
 
-to_plot_data_y_train_pred = np.zeros(num_data_points)
-to_plot_data_y_val_pred = np.zeros(num_data_points)
+to_plot_data_y_train_pred = np.full(num_points, np.nan, dtype=float)
+to_plot_data_y_val_pred   = np.full(num_points, np.nan, dtype=float)
 
-to_plot_data_y_train_pred[config["data"]["window_size"]:split_index+config["data"]["window_size"]] = scaler.inverse_transform(predicted_train)
-to_plot_data_y_val_pred[split_index+config["data"]["window_size"]:] = scaler.inverse_transform(predicted_val)
+# 起止索引（与真实 y 的对齐完全一致）
+train_start = offset + window_size
+train_end   = train_start + len(predicted_train)
 
-to_plot_data_y_train_pred = np.where(to_plot_data_y_train_pred == 0, None, to_plot_data_y_train_pred)
-to_plot_data_y_val_pred = np.where(to_plot_data_y_val_pred == 0, None, to_plot_data_y_val_pred)
+val_start   = offset + window_size + split_index
+val_end     = val_start + len(predicted_val)
+
+# 防越界 + 保证长度匹配
+assert 0 <= train_start <= train_end <= num_points
+assert 0 <= val_start   <= val_end   <= num_points
+
+# inverse_transform 需要二维；再 ravel 回一维
+pred_train_inv = scaler.inverse_transform(np.asarray(predicted_train).reshape(-1, 1)).ravel()
+pred_val_inv   = scaler.inverse_transform(np.asarray(predicted_val).reshape(-1, 1)).ravel()
+
+# 再次校验左右长度一致
+assert (train_end - train_start) == len(pred_train_inv)
+assert (val_end   - val_start)   == len(pred_val_inv)
+
+# 赋值
+to_plot_data_y_train_pred[train_start:train_end] = pred_train_inv
+to_plot_data_y_val_pred[val_start:val_end]       = pred_val_inv
+
 
 # plots
 
 fig = figure(figsize=(25, 5), dpi=80)
 fig.patch.set_facecolor((1.0, 1.0, 1.0))
-plt.plot(data_date, data_close_price, label="Actual prices", color=config["plots"]["color_actual"])
+plt.plot(data_date, data_close, label="Actual prices", color=config["plots"]["color_actual"])
 plt.plot(data_date, to_plot_data_y_train_pred, label="Predicted prices (train)", color=config["plots"]["color_pred_train"])
 plt.plot(data_date, to_plot_data_y_val_pred, label="Predicted prices (validation)", color=config["plots"]["color_pred_val"])
 plt.title("Compare predicted prices to actual prices")
@@ -374,63 +436,117 @@ plt.grid(True, which='major', axis='y', linestyle='--')
 plt.legend()
 plt.show()
 
-# prepare data for plotting the zoomed in view of the predicted prices vs. actual prices
+# === zoomed-in plotting: align dates with offset and lengths ===
+window_size = config["data"]["window_size"]
 
-to_plot_data_y_val_subset = scaler.inverse_transform(data_y_val)
-to_plot_predicted_val = scaler.inverse_transform(predicted_val)
-to_plot_data_date = data_date[split_index+config["data"]["window_size"]:]
+# 反归一化 (确保二维输入再拉平)
+y_val_inv = scaler.inverse_transform(np.asarray(data_y_val).reshape(-1, 1)).ravel()
+pred_val_inv = scaler.inverse_transform(np.asarray(predicted_val).reshape(-1, 1)).ravel()
 
-# plots
+# 若预测数量和标签数量不等（例如 DataLoader(drop_last=True)），裁成相同长度
+L = min(len(y_val_inv), len(pred_val_inv))
+y_val_inv = y_val_inv[:L]
+pred_val_inv = pred_val_inv[:L]
 
-fig = figure(figsize=(25, 5), dpi=80)
+# 日期序列与 y 对齐（关键：加 offset）
+val_start = offset + window_size + split_index
+val_end   = val_start + L
+dates_val = np.asarray(data_date)[val_start:val_end]
+
+# 自检，防越界/长度不一致
+assert len(dates_val) == L, (len(dates_val), L)
+
+# --------- 画图（两种写法选一种）---------
+
+# 写法 A：用日期做 x（更直观）
+import matplotlib.pyplot as plt
+fig = plt.figure(figsize=(25, 5), dpi=80)
 fig.patch.set_facecolor((1.0, 1.0, 1.0))
-plt.plot(to_plot_data_date, to_plot_data_y_val_subset, label="Actual prices", color=config["plots"]["color_actual"])
-plt.plot(to_plot_data_date, to_plot_predicted_val, label="Predicted prices (validation)", color=config["plots"]["color_pred_val"])
+plt.plot(dates_val, y_val_inv,  label="Actual prices",    color=config["plots"]["color_actual"])
+plt.plot(dates_val, pred_val_inv, label="Predicted prices (validation)", color=config["plots"]["color_pred_val"])
 plt.title("Zoom in to examine predicted price on validation data portion")
-xticks = [to_plot_data_date[i] if ((i%int(config["plots"]["xticks_interval"]/5)==0 and (len(to_plot_data_date)-i) > config["plots"]["xticks_interval"]/6) or i==len(to_plot_data_date)-1) else None for i in range(len(to_plot_data_date))] # make x ticks nice
-xs = np.arange(0,len(xticks))
-plt.xticks(xs, xticks, rotation='vertical')
 plt.grid(True, which='major', axis='y', linestyle='--')
 plt.legend()
+
+# 如果仍想稀疏显示 x 轴标签，可只抽取一部分位置：
+step = max(1, int(config["plots"]["xticks_interval"] // 5) or 1)
+tick_idx = [i for i in range(L) if (i % step == 0) or (i == L-1)]
+plt.xticks([dates_val[i] for i in tick_idx],
+           [dates_val[i] for i in tick_idx], rotation='vertical')
+
 plt.show()
+
+# （可选）写法 B：用索引作为 x，然后把日期当作刻度标签
+# xs = np.arange(L)
+# plt.plot(xs, y_val_inv,  ...)
+# plt.plot(xs, pred_val_inv, ...)
+# 同样按 step 取 tick_idx，然后 plt.xticks(xs[tick_idx], dates_val[tick_idx], rotation='vertical')
+
 
 # predict the closing price of the next trading day
 
 model.eval()
 
-x = torch.tensor(data_x_unseen).float().to(config["training"]["device"]).unsqueeze(0).unsqueeze(2) # this is the data type and shape required, [batch, sequence, feature]
-prediction = model(x)
-prediction = prediction.cpu().detach().numpy()
+x = torch.tensor(data_x_unseen, dtype=torch.float32, device=config["training"]["device"]).unsqueeze(0)  # [1, window, F]
+with torch.no_grad():
+    prediction = model(x)              # 形状通常是 [1, out_dim] 或 [1, seq, out_dim]
+prediction = prediction.cpu().numpy()
 
-# prepare plots
 
-plot_range = 10
-to_plot_data_y_val = np.zeros(plot_range)
-to_plot_data_y_val_pred = np.zeros(plot_range)
-to_plot_data_y_test_pred = np.zeros(plot_range)
+# === prepare plots (robust) ===
+plot_range = 10                      # 想展示的最后N天 + 明天
+assert plot_range >= 2               # 至少要有 (N-1) 个历史点 + 1 个明天
 
-to_plot_data_y_val[:plot_range-1] = scaler.inverse_transform(data_y_val)[-plot_range+1:]
-to_plot_data_y_val_pred[:plot_range-1] = scaler.inverse_transform(predicted_val)[-plot_range+1:]
+window_size = config["data"]["window_size"]
 
-to_plot_data_y_test_pred[plot_range-1] = scaler.inverse_transform(prediction)
+# 1) 反归一化（确保二维输入再拉平）
+y_val_inv   = scaler.inverse_transform(np.asarray(data_y_val).reshape(-1, 1)).ravel()
+pred_val_inv= scaler.inverse_transform(np.asarray(predicted_val).reshape(-1, 1)).ravel()
 
-to_plot_data_y_val = np.where(to_plot_data_y_val == 0, None, to_plot_data_y_val)
-to_plot_data_y_val_pred = np.where(to_plot_data_y_val_pred == 0, None, to_plot_data_y_val_pred)
-to_plot_data_y_test_pred = np.where(to_plot_data_y_test_pred == 0, None, to_plot_data_y_test_pred)
+# 对“明天”的预测做反归一化；prediction 可能是 [1] / [1,1] / [seq,1]，统一成标量
+pred_next_inv_arr = scaler.inverse_transform(np.asarray(prediction).reshape(-1, 1)).ravel()
+pred_next_inv = float(pred_next_inv_arr[-1])  # 取最后一个作为“下一天”的点
 
-# plot
+# 2) 历史展示长度（N-1），与实际可用长度对齐
+hist_len = min(plot_range - 1, len(y_val_inv), len(pred_val_inv))
+assert hist_len >= 1, f"hist_len too small: {hist_len}, check data_y_val/predicted_val lengths"
 
-plot_date_test = data_date[-plot_range+1:]
-plot_date_test.append("tomorrow")
+# 3) 日期对齐：验证段起点 = offset + window + split_index
+val_start = offset + window_size + split_index
+dates_val_full = np.asarray(data_date)[val_start: val_start + len(y_val_inv)]
+assert len(dates_val_full) == len(y_val_inv), "Dates and y_val_inv length mismatch"
 
+# 取验证段最后 hist_len 天的日期
+dates_hist = dates_val_full[-hist_len:]
+
+# 4) 组装绘图数组：长度 = hist_len + 1（+1 是“明天”）
+to_plot_data_y_val       = np.full(hist_len + 1, np.nan)
+to_plot_data_y_val_pred  = np.full(hist_len + 1, np.nan)
+to_plot_data_y_test_pred = np.full(hist_len + 1, np.nan)
+
+# 填充最后 hist_len 天的真实值 & 过去预测
+to_plot_data_y_val[:hist_len]      = y_val_inv[-hist_len:]
+to_plot_data_y_val_pred[:hist_len] = pred_val_inv[-hist_len:]
+
+# 最后一个位置放“明天”的预测
+to_plot_data_y_test_pred[-1] = pred_next_inv
+
+# 5) 构造 x 轴日期（在最后加上一个“tomorrow”占位标签）
+plot_date_test = list(dates_hist) + ["tomorrow"]
+
+# 6) 画图
 fig = figure(figsize=(25, 5), dpi=80)
 fig.patch.set_facecolor((1.0, 1.0, 1.0))
-plt.plot(plot_date_test, to_plot_data_y_val, label="Actual prices", marker=".", markersize=10, color=config["plots"]["color_actual"])
-plt.plot(plot_date_test, to_plot_data_y_val_pred, label="Past predicted prices", marker=".", markersize=10, color=config["plots"]["color_pred_val"])
-plt.plot(plot_date_test, to_plot_data_y_test_pred, label="Predicted price for next day", marker=".", markersize=20, color=config["plots"]["color_pred_test"])
+
+plt.plot(plot_date_test, to_plot_data_y_val,       label="Actual prices",              marker=".", markersize=10, color=config["plots"]["color_actual"])
+plt.plot(plot_date_test, to_plot_data_y_val_pred,  label="Past predicted prices",      marker=".", markersize=10, color=config["plots"]["color_pred_val"])
+plt.plot(plot_date_test, to_plot_data_y_test_pred, label="Predicted price (tomorrow)", marker=".", markersize=20, color=config["plots"]["color_pred_test"])
+
 plt.title("Predicting the close price of the next trading day")
 plt.grid(True, which='major', axis='y', linestyle='--')
 plt.legend()
 plt.show()
 
-print("Predicted close price of the next trading day:", round(to_plot_data_y_test_pred[plot_range-1], 2))
+print("Predicted close price of the next trading day:",
+      np.round(to_plot_data_y_test_pred[-1], 2))
+
