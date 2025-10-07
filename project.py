@@ -15,6 +15,13 @@ from alpha_vantage.timeseries import TimeSeries
 import yfinance as yf
 import pandas as pd
 
+from sklearn.metrics import (
+    accuracy_score, precision_recall_fscore_support,
+    roc_auc_score, average_precision_score,
+    confusion_matrix, classification_report,
+    roc_curve, precision_recall_curve
+)
+
 print("All libraries loaded")
 
 config = {
@@ -206,7 +213,7 @@ window_size = config["data"]["window_size"]
 raw_cut = raw_close[offset:]                       # [T']
 y_raw     = raw_cut[window_size:]                  # 对齐 data_y 的那一段（今天）
 y_raw_prev= raw_cut[window_size-1:-1]              # 昨天
-data_y_cls = (y_raw - y_raw_prev > 0).astype(np.float32)  # 涨=1 跌=0
+data_y_cls = (y_raw - y_raw_prev > 0).astype(np.float32) # 涨=1 跌=0
 assert len(data_y_cls) == len(data_y)
 
 # 训练/验证划分
@@ -336,7 +343,7 @@ def run_epoch(dataloader, is_training=False):
         pred_reg, logit = model(x)  # [B], [B]
         loss_reg = criterion_reg(pred_reg.contiguous(), y_reg.contiguous())
         loss_cls = criterion_cls(logit.contiguous(), y_cls.view(-1))
-        loss = loss_reg + config["training"]["lambda_cls"] * loss_cls
+        loss = 0.7 * loss_reg + 0.3 * config["training"]["lambda_cls"] * loss_cls
 
         if is_training:
             loss.backward()
@@ -412,17 +419,158 @@ with torch.no_grad():
 
 # predict on the validation data, to see how the model does
 
-predicted_val = np.array([])
-prob_val      = np.array([])
+predicted_val   = np.array([])
+prob_val        = np.array([])
+yval_cls_true   = np.array([])        # ★ 新增：收集验证集真实标签（0/1）
 
 for idx, (x, y_reg, y_cls) in enumerate(val_dataloader):
     x = x.to(config["training"]["device"])
     with torch.no_grad():
         pred_reg, logit = model(x)
         out = pred_reg.cpu().numpy()                 # 回归
-        p   = torch.sigmoid(logit).cpu().numpy()     # 概率
-    predicted_val = np.concatenate((predicted_val, out))
-    prob_val      = np.concatenate((prob_val, p))
+        p   = torch.sigmoid(logit).cpu().numpy()     # 概率(正类=上涨)
+    predicted_val  = np.concatenate((predicted_val, out))
+    prob_val       = np.concatenate((prob_val, p))
+    yval_cls_true  = np.concatenate((yval_cls_true, y_cls.numpy().ravel()))   # ★ 展平
+
+
+# ===== Classification metrics on VALIDATION =====
+
+# 1) 阈值与离散预测
+cls_threshold = 0.5   # 你也可以放到 config["metrics"]["cls_threshold"]
+y_pred_cls = (prob_val >= cls_threshold).astype(np.int32)
+
+# 2) 基本指标
+acc = accuracy_score(yval_cls_true, y_pred_cls)
+prec, rec, f1, _ = precision_recall_fscore_support(yval_cls_true, y_pred_cls, average='binary', zero_division=0)
+
+# 3) 概率指标（不需要阈值）
+try:
+    auc_roc = roc_auc_score(yval_cls_true, prob_val)
+except ValueError:
+    auc_roc = float('nan')
+try:
+    auc_pr  = average_precision_score(yval_cls_true, prob_val)
+except ValueError:
+    auc_pr = float('nan')
+
+print("\n[VAL | Classification]")
+print(f"Threshold = {cls_threshold:.2f}")
+print(f"Accuracy   = {acc:.4f}")
+print(f"Precision  = {prec:.4f}")
+print(f"Recall     = {rec:.4f}")
+print(f"F1-score   = {f1:.4f}")
+print(f"ROC-AUC    = {auc_roc:.4f}")
+print(f"PR-AUC     = {auc_pr:.4f}")
+
+# 4) 更详细的分类报告（每类Precision/Recall/F1）
+print("\nClassification report:\n", classification_report(yval_cls_true, y_pred_cls, digits=4))
+
+# 5) 混淆矩阵可视化
+cm = confusion_matrix(yval_cls_true, y_pred_cls)
+plt.figure(figsize=(4,4))
+plt.imshow(cm, cmap='Blues')
+plt.title('Confusion Matrix (Val)')
+plt.xlabel('Predicted'); plt.ylabel('Actual')
+for (i, j), v in np.ndenumerate(cm):
+    plt.text(j, i, int(v), ha='center', va='center')
+plt.colorbar()
+plt.tight_layout()
+plt.show()
+
+# 6) ROC 曲线
+fpr, tpr, _ = roc_curve(yval_cls_true, prob_val)
+plt.figure(figsize=(5,4))
+plt.plot(fpr, tpr, label=f'ROC-AUC={auc_roc:.3f}')
+plt.plot([0,1],[0,1],'--')
+plt.xlabel('FPR'); plt.ylabel('TPR'); plt.title('ROC (Val)')
+plt.legend(); plt.grid(True, linestyle='--', alpha=0.5)
+plt.tight_layout()
+plt.show()
+
+# 7) PR 曲线
+prec_curve, rec_curve, _ = precision_recall_curve(yval_cls_true, prob_val)
+plt.figure(figsize=(5,4))
+plt.plot(rec_curve, prec_curve, label=f'PR-AUC={auc_pr:.3f}')
+plt.xlabel('Recall'); plt.ylabel('Precision'); plt.title('PR Curve (Val)')
+plt.legend(); plt.grid(True, linestyle='--', alpha=0.5)
+plt.tight_layout()
+plt.show()
+
+# 8) （可选）阈值扫描，找F1最优阈值
+prec_s, rec_s, thr_s = precision_recall_curve(yval_cls_true, prob_val)
+f1_s = 2 * prec_s * rec_s / (prec_s + rec_s + 1e-12)
+best_idx = np.nanargmax(f1_s)
+best_thr = thr_s[max(best_idx-1, 0)] if best_idx < len(thr_s) else 0.5
+print(f"[VAL] Best-F1 threshold ~ {best_thr:.3f} (F1={np.nanmax(f1_s):.4f})")
+
+
+# =====================================================
+# ====  Mini Backtest: evaluate predicted direction ====
+# =====================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+
+# 假设我们用验证集 (VAL) 做回测
+# 使用反归一化后的真实价格 + 预测信号
+# pred_val_inv, prob_val, yval_cls_true, data_date, val_start, val_end 已定义
+
+print("\n[BACKTEST] Running minimal backtest on validation set...")
+
+# 对齐真实价格（使用验证集对应的切片）
+close_price_val = np.array(data_close[val_start:val_end]).ravel()
+date_val = np.array(data_date[val_start:val_end])
+
+# 计算真实收益率
+ret_real = np.diff(close_price_val) / close_price_val[:-1]
+
+# 用模型信号（上涨概率 > 阈值 → 做多；否则做空）
+signal = np.where(prob_val[1:] > 0.5, 1, -1)
+
+# 模拟每日收益（当天开仓、第二天平仓）
+ret_strategy = signal * ret_real
+
+# 计算累计收益
+cum_ret = np.cumprod(1 + ret_strategy) - 1
+
+# 基本绩效指标
+hit_rate = np.mean((signal > 0) == (ret_real > 0))
+avg_daily_ret = np.mean(ret_strategy)
+std_daily_ret = np.std(ret_strategy)
+sharpe = avg_daily_ret / (std_daily_ret + 1e-9) * np.sqrt(252)  # 年化 Sharpe
+
+print(f"Hit rate (方向预测正确率): {hit_rate:.3f}")
+print(f"平均日收益: {avg_daily_ret:.5f}")
+print(f"标准差: {std_daily_ret:.5f}")
+print(f"年化Sharpe比率: {sharpe:.3f}")
+print(f"总收益: {cum_ret[-1]*100:.2f}% over {len(ret_strategy)} days")
+
+# 绘制策略与价格曲线
+plt.figure(figsize=(10,4))
+plt.plot(date_val[1:], cum_ret, label='Strategy Cumulative Return')
+plt.title("Validation Backtest (Up/Down Signal)")
+plt.xlabel("Date")
+plt.ylabel("Cumulative Return")
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# 价格 vs 信号可视化（红色=做空，绿色=做多）
+plt.figure(figsize=(10,4))
+plt.plot(date_val, close_price_val, label='Price', color='black')
+buy_idx = np.where(signal > 0)[0]
+sell_idx = np.where(signal < 0)[0]
+plt.scatter(date_val[1:][buy_idx], close_price_val[1:][buy_idx], color='green', marker='^', label='Long')
+plt.scatter(date_val[1:][sell_idx], close_price_val[1:][sell_idx], color='red', marker='v', label='Short')
+plt.title("Predicted Trading Signals (Validation)")
+plt.legend()
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.tight_layout()
+plt.show()
+
 
 
 # === prepare data for plotting (predictions) ===
