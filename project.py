@@ -38,7 +38,7 @@ config = {
         "color_pred_test": "#FF4136",
     },
     "model": {
-        "input_size": 1, # since we are only using 1 feature, close price
+        "input_size": 12, # 12 features
         "num_lstm_layers": 2,
         "lstm_size": 32,
         "dropout": 0.2,
@@ -109,31 +109,80 @@ class Normalizer():
 scaler = Normalizer()
 normalized_data_close_price = scaler.fit_transform(data_close_price)
 
-def prepare_data_x(x, window_size):
-    # perform windowing
-    n_row = x.shape[0] - window_size + 1
-    output = np.lib.stride_tricks.as_strided(x, shape=(n_row, window_size), strides=(x.strides[0], x.strides[0]))
-    return output[:-1], output[-1]
+# ===== 新增：技术指标构建 =====
+
+def build_features_from_close(close_np: np.ndarray):
+    """
+    输入: close_np 为 shape [T] 的原始收盘价（未标准化）
+    输出: features_df (dropna 后), 对齐到有效起点
+    """
+    df = pd.DataFrame({"close": close_np})
+    # 1) 一阶收益/对数收益
+    df["ret1"] = df["close"].pct_change()
+    df["logret1"] = np.log(df["close"]).diff()
+
+    # 2) 移动平均 / EMA / MACD
+    df["sma5"]  = df["close"].rolling(5).mean()
+    df["sma10"] = df["close"].rolling(10).mean()
+    df["ema12"] = df["close"].ewm(span=12, adjust=False).mean()
+    df["ema26"] = df["close"].ewm(span=26, adjust=False).mean()
+    macd = df["ema12"] - df["ema26"]
+    macd_sig = macd.ewm(span=9, adjust=False).mean()
+    df["macd"] = macd
+    df["macd_sig"] = macd_sig
+    df["macd_hist"] = macd - macd_sig
+
+    # 3) 布林带 z-score（20日）
+    mid = df["close"].rolling(20).mean()
+    std = df["close"].rolling(20).std()
+    df["bb_z"] = (df["close"] - mid) / std
+
+    # 4) 近 5 日年化波动率（用对数收益）
+    df["rv5"] = df["logret1"].rolling(5).std() * np.sqrt(252)
+
+    # 防泄漏：只使用到当日（滚动/EMA 自带因果性）
+    df = df.dropna().reset_index(drop=True)
+
+    feature_cols = ["close","ret1","logret1","sma5","sma10","ema12","ema26",
+                    "macd","macd_sig","macd_hist","bb_z","rv5"]
+    features = df[feature_cols].values.astype(np.float32)  # [T', F]
+    return features, feature_cols
 
 
-def prepare_data_y(x, window_size):
-    # # perform simple moving average
-    # output = np.convolve(x, np.ones(window_size), 'valid') / window_size
+def prepare_multifeat_windows(X_2d: np.ndarray, window_size: int):
+    """
+    输入: X_2d [T', F]
+    输出: X_win [N, window, F], X_unseen [window, F]
+    """
+    T, F = X_2d.shape
+    N = T - window_size
+    X_win = np.stack([X_2d[i:i+window_size, :] for i in range(N)], axis=0)
+    X_unseen = X_2d[-window_size:, :]
+    return X_win, X_unseen
 
-    # use the next day as label
-    output = x[window_size:]
-    return output
+# 1) 构造特征（用原始 close）
+features_raw, feature_cols = build_features_from_close(data_close_price)
 
-data_x, data_x_unseen = prepare_data_x(normalized_data_close_price, window_size=config["data"]["window_size"])
-data_y = prepare_data_y(normalized_data_close_price, window_size=config["data"]["window_size"])
+# 2) 按列标准化（改用已有 Normalizer，对 axis=0 生效）
+scaler_X = Normalizer()
+X_norm = scaler_X.fit_transform(features_raw)  # [T', F]
+F = X_norm.shape[1]
+config["model"]["input_size"] = F
 
-# split dataset
+# 3) 注意：y 仍然用“标准化后的 close”，要与特征对齐到相同 T'
+#    我们计算出 features 开始的相对起点偏移
+offset = len(data_close_price) - X_norm.shape[0]
+y_close_cut = normalized_data_close_price[offset:]  # [T']
 
+# 4) 造样本
+data_x, data_x_unseen = prepare_multifeat_windows(X_norm, config["data"]["window_size"])
+data_y = y_close_cut[config["data"]["window_size"]:]  # [T' - window]
+
+# 5) 训练/验证划分（与原版一致）
 split_index = int(data_y.shape[0]*config["data"]["train_split_size"])
-data_x_train = data_x[:split_index]
-data_x_val = data_x[split_index:]
-data_y_train = data_y[:split_index]
-data_y_val = data_y[split_index:]
+data_x_train, data_x_val = data_x[:split_index], data_x[split_index:]
+data_y_train, data_y_val = data_y[:split_index], data_y[split_index:]
+
 
 # prepare data for plotting
 
@@ -163,16 +212,10 @@ plt.show()
 
 class TimeSeriesDataset(Dataset):
     def __init__(self, x, y):
-        x = np.expand_dims(x,
-                           2)  # in our case, we have only 1 feature, so we need to convert `x` into [batch, sequence, features] for LSTM
-        self.x = x.astype(np.float32)
-        self.y = y.astype(np.float32)
-
-    def __len__(self):
-        return len(self.x)
-
-    def __getitem__(self, idx):
-        return (self.x[idx], self.y[idx])
+        self.x = x.astype(np.float32)   # [N, window, F]
+        self.y = y.astype(np.float32)   # [N]
+    def __len__(self): return len(self.x)
+    def __getitem__(self, idx): return (self.x[idx], self.y[idx])
 
 
 dataset_train = TimeSeriesDataset(data_x_train, data_y_train)
